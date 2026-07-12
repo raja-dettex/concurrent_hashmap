@@ -84,13 +84,13 @@ where
 { 
 
     #[inline]
-    fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Shared<'g, BinEntry<K,V>> { 
+    fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>> { 
         let shared_table = self.table.load(Ordering::SeqCst, guard);
         let mut hasher = self.build_hasher.build_hasher();
         key.hash(&mut hasher);
         let hash = hasher.finish();
         if shared_table.is_null() { 
-            return Shared::null();
+            return None;
         }
 
         // the safety here is because the shared pointer which is protected by epoch GC
@@ -99,8 +99,27 @@ where
         let table = unsafe { &*(shared_table.as_raw() as *const Table<K,V>) };
         let mask = (table.bins.len() - 1) as u64;
         let bini = hash & mask;
-        let bin = table.at(bini as usize, guard);
-        bin
+        let shared_bin = table.at(bini as usize, guard);
+        if shared_bin.is_null() {
+            return None;
+        }
+        let bin = unsafe { &*(shared_bin.as_raw())}; 
+        let shared_node = bin.find(key, hash, guard);
+        if shared_node.is_null() {
+            return None;
+        }
+        let node = unsafe { &*(shared_node.as_raw())};
+        let value = node.value.load(Ordering::SeqCst, guard);
+        Some(value)        
+    }
+
+
+    pub fn get_and<R, F: FnOnce(&V) -> R>(&self, key: &K, then: F) -> Option<R> {
+        let guard = crossbeam::epoch::pin();
+        self.get(key, &guard).map(|v| then(unsafe { &*(v.as_raw() )} ))
+    }
+
+    pub fn insert(&self, key: K, value: V) -> Option<V> { 
         
     }
 }
