@@ -1,8 +1,9 @@
 use std::{hash::{BuildHasher, Hash, Hasher, RandomState}, sync::atomic::Ordering};
 
-use crossbeam::epoch::{Atomic, Guard, Shared};
+use crossbeam::epoch::{Atomic, CompareExchangeError, Guard, Owned, Shared};
+use parking_lot::{Mutex, lock_api::RawMutex};
 
-use crate::node::BinEntry;
+use crate::node::{BinEntry, Node};
 
 /// The largest possible table capacity.  This value must be
 /// exactly 1<<30 to stay within Java array allocation and indexing
@@ -84,24 +85,129 @@ where
 { 
 
     #[inline]
-    fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Shared<'g, BinEntry<K,V>> { 
-        let shared_table = self.table.load(Ordering::SeqCst, guard);
+    fn hash(&self, key: &K) -> u64
+    {
         let mut hasher = self.build_hasher.build_hasher();
         key.hash(&mut hasher);
-        let hash = hasher.finish();
+        hasher.finish()
+    }
+    fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>> { 
+        let shared_table = self.table.load(Ordering::SeqCst, guard);
+        let hash = self.hash(key);
         if shared_table.is_null() { 
-            return Shared::null();
+            return None;
         }
 
         // the safety here is because the shared pointer which is protected by epoch GC
         // and the guard is valid so its safe to unalign the tag and get the raw pointer because
         // because the memory is not yet reclaimed to the allocator yet
         let table = unsafe { &*(shared_table.as_raw() as *const Table<K,V>) };
-        let mask = (table.bins.len() - 1) as u64;
-        let bini = hash & mask;
-        let bin = table.at(bini as usize, guard);
-        bin
-        
+        let bini = table.bini(hash);
+        let shared_bin = table.at(bini as usize, guard);
+        if shared_bin.is_null() {
+            return None;
+        }
+        let bin = unsafe { &*(shared_bin.as_raw())}; 
+        let shared_node = bin.find(key, hash, guard);
+        if shared_node.is_null() {
+            return None;
+        }
+        let node = unsafe { &*(shared_node.as_raw())};
+        let value = node.value.load(Ordering::SeqCst, guard);
+        Some(value)        
+    }
+
+
+    pub fn get_and<R, F: FnOnce(&V) -> R>(&self, key: &K, then: F) -> Option<R> {
+        let guard = crossbeam::epoch::pin();
+        self.get(key, &guard).map(|v| then(unsafe { &*(v.as_raw() )} ))
+    }
+
+    // pub fn insert(&self, key: K, value: V) -> Option<V> { 
+
+    // }
+
+    pub fn put(&self, key: K, value: V, no_replacement: bool) -> Option<()>{ 
+        let hash = self.hash(&key);
+        let guard = &crossbeam::epoch::pin();
+        let shared_table = self.table.load(Ordering::SeqCst, guard);
+        let mut new_node = Owned::new(BinEntry::Node(Node { 
+            key,
+            value: Atomic::new(value),
+            hash, 
+            next: Atomic::null(),
+            lock: Mutex::new(())
+        }));
+        loop { 
+            let shared_table = self.table.load(Ordering::SeqCst, guard);
+            if shared_table.is_null() {
+                self.init_table();
+                continue;
+            }
+            let table = unsafe { &*(shared_table.as_raw())};
+            let bini = table.bini(hash);
+            let mut shared_bin = table.at(bini, guard);
+            if shared_bin.is_null() { 
+                // fast path - shared bin is empty stick us to the head of the bin
+                // create the bin and just do compare and set
+                match table.cas_at(bini, shared_bin, new_node, guard) {
+                    Ok(garbage_now) => assert!(garbage_now.is_null()),
+                    Err(changed) => { 
+                        assert!(!changed.current.is_null());
+                        new_node = changed.new;
+                        shared_bin = changed.current;
+                    }
+                }
+            } 
+            // slow path: bin exists so create the node and stick the node to bin linked list
+            let bin = unsafe { &*(shared_bin.as_raw())};
+            match *bin {
+                BinEntry::Moved(next_table) => table.help_transfer(next_table),
+                BinEntry::Node(ref head) if no_replacement && head.hash == hash && head.key == key => {
+                        // replacement are disallowed and bin matches with the first
+                        return Some(());
+                },
+                BinEntry::Node(ref head )=> {
+                    let _guard = head.lock.lock();
+                    // need to check that this is still the head
+                    let current_head = table.at(bini as usize, guard);
+                    if current_head.as_raw() != shared_bin.as_raw() {
+                        // no - try again from the start
+                        continue;
+                    }
+                    
+
+                    // yes it is still the head so we now can 'Own' the bin
+                    // owning here means there is still readers looking into it
+                    
+
+                    // TODO: TreeBin and Reservations
+                    let mut bin_count = 1;
+                    let mut n = head;
+                    let old_val = loop { 
+                        if n.hash == hash && n.key == key {
+                            // the key already exists in the map 
+                            if no_replacement { 
+                                // dont update
+                            } else { 
+                                let now_garbage = n.value.swap(Owned::new(value), Ordering::SeqCst, guard);
+                                // we dont need to immediately drop the guard and reclaim cause there might still be readers
+                                // so instead we should defer destroy and how we should do it is still unclear
+                                break Some(());
+                            }
+
+                            let shared_next = n.next.load(Ordering::SeqCst, guard);
+                            if shared_next.is_null() {
+                                // still stick here
+                                let next = unsafe { *(shared_next.as_raw())};
+                                next.value.store(Owned::new(value), Ordering::SeqCst);
+                                break None;
+                            }
+                        }
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -115,8 +221,25 @@ where K: Eq
 impl<K,V>  Table<K,V> 
 where K: Eq
 {
+
+    #[inline]
+    pub fn bini(&self, hash: u64) -> usize{ 
+        let mask = (self.bins.len() - 1) as u64;
+        (hash & mask) as usize
+    }
     #[inline]
     fn at<'g>(&'g self, index: usize, guard: &'g Guard) -> Shared<'g, BinEntry<K,V>> { 
         self.bins[index].load(Ordering::SeqCst, guard)
+    }
+
+    fn cas_at<'g>(
+        &'g self,
+        index: usize,
+        old_shared: Shared<'g, BinEntry<K,V>>,
+        new_node: Owned<BinEntry<K,V>>,
+        guard: &'g Guard
+    ) -> Result<Shared<'g, BinEntry<K,V>>, CompareExchangeError<'g, BinEntry<K,V>, Owned<BinEntry<K,V>>>>
+    {
+        self.bins[index].compare_exchange(old_shared, new_node, Ordering::SeqCst, Ordering::SeqCst, guard)
     }
 }
